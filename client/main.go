@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/sha1"
-	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
@@ -14,79 +13,60 @@ import (
 
 	"golang.org/x/crypto/pbkdf2"
 
-	"github.com/golang/snappy"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
-	"github.com/xtaci/kcp-go"
+	"github.com/xtaci/kcp-go/v5"
+	"github.com/xtaci/kcptun/generic"
 	"github.com/xtaci/smux"
-
-	"path/filepath"
 )
 
-var (
-	// VERSION is injected by buildflags
-	VERSION = "SELFBUILD"
+const (
 	// SALT is use for pbkdf2 key expansion
 	SALT = "kcp-go"
-	VpnMode = false
+	// maximum supported smux version
+	maxSmuxVer = 2
+	// stream copy buffer size
+	bufSize = 4096
 )
 
-type compStream struct {
-	conn net.Conn
-	w    *snappy.Writer
-	r    *snappy.Reader
-}
+var VpnMode = false
 
-func (c *compStream) Read(p []byte) (n int, err error) {
-	return c.r.Read(p)
-}
+// VERSION is injected by buildflags
+var VERSION = "SELFBUILD"
 
-func (c *compStream) Write(p []byte) (n int, err error) {
-	n, err = c.w.Write(p)
-	err = c.w.Flush()
-	return n, err
-}
-
-func (c *compStream) Close() error {
-	return c.conn.Close()
-}
-
-func newCompStream(conn net.Conn) *compStream {
-	c := new(compStream)
-	c.conn = conn
-	c.w = snappy.NewBufferedWriter(conn)
-	c.r = snappy.NewReader(conn)
-	return c
-}
-
-func handleClient(sess *smux.Session, p1 io.ReadWriteCloser, quiet bool) {
-
-	// if !quiet {
-	// 	log.Println("stream opened")
-	// 	defer log.Println("stream closed")
-	// }
-
+// handleClient aggregates connection p1 on mux with 'writeLock'
+func handleClient(session *smux.Session, p1 net.Conn, quiet bool) {
+	logln := func(v ...interface{}) {
+		// if !quiet {
+		// 	log.Println(v...)
+		// }
+	}
 	defer p1.Close()
-	p2, err := sess.OpenStream()
+	p2, err := session.OpenStream()
 	if err != nil {
+		logln(err)
 		return
 	}
+
 	defer p2.Close()
 
-	// start tunnel
-	p1die := make(chan struct{})
-	buf1 := make([]byte, 65535)
-	go func() { io.CopyBuffer(p1, p2, buf1); close(p1die) }()
+	logln("stream opened", "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
+	defer logln("stream closed", "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
 
-	p2die := make(chan struct{})
-	buf2 := make([]byte, 65535)
-	go func() { io.CopyBuffer(p2, p1, buf2); close(p2die) }()
-
-	// wait for tunnel termination
-	select {
-	case <-p1die:
-	case <-p2die:
+	// start tunnel & wait for tunnel termination
+	streamCopy := func(dst io.Writer, src io.ReadCloser) {
+		if _, err := generic.Copy(dst, src); err != nil {
+			// report protocol error
+			if err == smux.ErrInvalidProtocol {
+				log.Println("smux", err, "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
+			}
+		}
+		p1.Close()
+		p2.Close()
 	}
+
+	go streamCopy(p1, p2)
+	streamCopy(p2, p1)
 }
 
 func checkError(err error) {
@@ -96,156 +76,181 @@ func checkError(err error) {
 	}
 }
 
+type timedSession struct {
+	session    *smux.Session
+	expiryDate time.Time
+}
+
 func main() {
 	rand.Seed(int64(time.Now().Nanosecond()))
 	if VERSION == "SELFBUILD" {
 		// add more log flags for debugging
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
+
 	myApp := cli.NewApp()
 	myApp.Name = "kcptun"
 	myApp.Usage = "client(with SMUX)"
 	myApp.Version = VERSION
 	myApp.Flags = []cli.Flag{
-		&cli.StringFlag{
+		cli.StringFlag{
 			Name:  "localaddr,l",
 			Value: ":12948",
 			Usage: "local listen address",
 		},
-		&cli.StringFlag{
+		cli.StringFlag{
 			Name:  "remoteaddr, r",
 			Value: "vps:29900",
 			Usage: "kcp server address",
 		},
-		&cli.StringFlag{
+		cli.StringFlag{
 			Name:   "key",
 			Value:  "it's a secrect",
 			Usage:  "pre-shared secret between client and server",
-			EnvVars: []string{"KCPTUN_KEY"},
+			EnvVar: "KCPTUN_KEY",
 		},
-		&cli.StringFlag{
+		cli.StringFlag{
 			Name:  "crypt",
 			Value: "aes",
-			Usage: "aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none",
+			Usage: "aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none, null",
 		},
-		&cli.StringFlag{
+		cli.StringFlag{
 			Name:  "mode",
 			Value: "fast",
 			Usage: "profiles: fast3, fast2, fast, normal, manual",
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:  "conn",
 			Value: 1,
 			Usage: "set num of UDP connections to server",
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:  "autoexpire",
 			Value: 10,
 			Usage: "set auto expiration time(in seconds) for a single UDP connection, 0 to disable",
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:  "scavengettl",
 			Value: 600,
-			Usage: "set how long an expired connection can live(in sec), -1 to disable",
+			Usage: "set how long an expired connection can live (in seconds)",
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:  "mtu",
 			Value: 1350,
 			Usage: "set maximum transmission unit for UDP packets",
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:  "sndwnd",
 			Value: 128,
 			Usage: "set send window size(num of packets)",
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:  "rcvwnd",
 			Value: 512,
 			Usage: "set receive window size(num of packets)",
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:  "datashard,ds",
 			Value: 10,
 			Usage: "set reed-solomon erasure coding - datashard",
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:  "parityshard,ps",
 			Value: 3,
 			Usage: "set reed-solomon erasure coding - parityshard",
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:  "dscp",
 			Value: 0,
 			Usage: "set DSCP(6bit)",
 		},
-		&cli.BoolFlag{
+		cli.BoolFlag{
 			Name:  "nocomp",
 			Usage: "disable compression",
 		},
-		&cli.BoolFlag{
+		cli.BoolFlag{
 			Name:   "acknodelay",
 			Usage:  "flush ack immediately when a packet is received",
 			Hidden: true,
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:   "nodelay",
 			Value:  0,
 			Hidden: true,
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:   "interval",
 			Value:  50,
 			Hidden: true,
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:   "resend",
 			Value:  0,
 			Hidden: true,
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:   "nc",
 			Value:  0,
 			Hidden: true,
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:  "sockbuf",
 			Value: 4194304, // socket buffer size in bytes
 			Usage: "per-socket buffer in bytes",
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
+			Name:  "smuxver",
+			Value: 1,
+			Usage: "specify smux version, available 1,2",
+		},
+		cli.IntFlag{
+			Name:  "smuxbuf",
+			Value: 4194304,
+			Usage: "the overall de-mux buffer in bytes",
+		},
+		cli.IntFlag{
+			Name:  "streambuf",
+			Value: 2097152,
+			Usage: "per stream receive buffer in bytes, smux v2+",
+		},
+		cli.IntFlag{
 			Name:  "keepalive",
 			Value: 10, // nat keepalive interval in seconds
 			Usage: "seconds between heartbeats",
 		},
-		&cli.StringFlag{
+		cli.StringFlag{
 			Name:  "snmplog",
 			Value: "",
 			Usage: "collect snmp to file, aware of timeformat in golang, like: ./snmp-20060102.log",
 		},
-		&cli.IntFlag{
+		cli.IntFlag{
 			Name:  "snmpperiod",
 			Value: 60,
 			Usage: "snmp collect period, in seconds",
 		},
-		&cli.StringFlag{
+		cli.StringFlag{
 			Name:  "log",
 			Value: "",
 			Usage: "specify a log file to output, default goes to stderr",
 		},
-		&cli.BoolFlag{
+		cli.BoolFlag{
 			Name:  "quiet",
 			Usage: "to suppress the 'stream open/close' messages",
 		},
-		&cli.StringFlag{
+		cli.BoolFlag{
+			Name:  "tcp",
+			Usage: "to emulate a TCP connection(linux)",
+		},
+		cli.StringFlag{
 			Name:  "c",
 			Value: "", // when the value is not empty, the config path must exists
 			Usage: "config from json file, which will override the command from shell",
 		},
-		&cli.BoolFlag{
+		cli.BoolFlag{
 			Name:  "fast-open",
 			Usage: "Dummy flag, doesn't really do anything",
 		},
-		&cli.BoolFlag{
+		cli.BoolFlag{
 			Name:  "V",
 			Usage: "Enable VPN mode for shadowsocks-android",
 		},
@@ -274,11 +279,15 @@ func main() {
 		config.Resend = c.Int("resend")
 		config.NoCongestion = c.Int("nc")
 		config.SockBuf = c.Int("sockbuf")
+		config.SmuxBuf = c.Int("smuxbuf")
+		config.StreamBuf = c.Int("streambuf")
+		config.SmuxVer = c.Int("smuxver")
 		config.KeepAlive = c.Int("keepalive")
 		config.Log = c.String("log")
 		config.SnmpLog = c.String("snmplog")
 		config.SnmpPeriod = c.Int("snmpperiod")
 		config.Quiet = c.Bool("quiet")
+		config.TCP = c.Bool("tcp")
 		config.Vpn = c.Bool("V")
 
 		if c.String("c") != "" {
@@ -384,6 +393,21 @@ func main() {
 					config.SockBuf = sockbuf
 				}
 			}
+			if c, b := opts.Get("smuxver"); b {
+				if smuxver, err := strconv.Atoi(c); err == nil {
+					config.SmuxVer = smuxver
+				}
+			}
+			if c, b := opts.Get("smuxbuf"); b {
+				if smuxbuf, err := strconv.Atoi(c); err == nil {
+					config.SmuxBuf = smuxbuf
+				}
+			}
+			if c, b := opts.Get("streambuf"); b {
+				if streambuf, err := strconv.Atoi(c); err == nil {
+					config.StreamBuf = streambuf
+				}
+			}
 			if c, b := opts.Get("keepalive"); b {
 				if keepalive, err := strconv.Atoi(c); err == nil {
 					config.KeepAlive = keepalive
@@ -403,6 +427,11 @@ func main() {
 			if c, b := opts.Get("quiet"); b {
 				if quiet, err := strconv.ParseBool(c); err == nil {
 					config.Quiet = quiet
+				}
+			}
+			if c, b := opts.Get("tcp"); b {
+				if tcp, err := strconv.ParseBool(c); err == nil {
+					config.TCP = tcp
 				}
 			}
 			if _, b := opts.Get("__android_vpn"); b {
@@ -435,10 +464,46 @@ func main() {
 		listener, err := net.ListenTCP("tcp", addr)
 		checkError(err)
 
+		log_init()
+
+		log.Println("smux version:", config.SmuxVer)
+		log.Println("listening on:", listener.Addr())
+		log.Println("encryption:", config.Crypt)
+		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
+		log.Println("remote address:", config.RemoteAddr)
+		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
+		log.Println("compression:", !config.NoComp)
+		log.Println("mtu:", config.MTU)
+		log.Println("datashard:", config.DataShard, "parityshard:", config.ParityShard)
+		log.Println("acknodelay:", config.AckNodelay)
+		log.Println("dscp:", config.DSCP)
+		log.Println("sockbuf:", config.SockBuf)
+		log.Println("smuxbuf:", config.SmuxBuf)
+		log.Println("streambuf:", config.StreamBuf)
+		log.Println("keepalive:", config.KeepAlive)
+		log.Println("conn:", config.Conn)
+		log.Println("autoexpire:", config.AutoExpire)
+		log.Println("scavengettl:", config.ScavengeTTL)
+		log.Println("snmplog:", config.SnmpLog)
+		log.Println("snmpperiod:", config.SnmpPeriod)
+		log.Println("quiet:", config.Quiet)
+		log.Println("tcp:", config.TCP)
+		log.Println("vpn:", config.Vpn)
+
+		VpnMode = config.Vpn
+
+		// parameters check
+		if config.SmuxVer > maxSmuxVer {
+			log.Fatal("unsupported smux version:", config.SmuxVer)
+		}
+
 		log.Println("initiating key derivation")
 		pass := pbkdf2.Key([]byte(config.Key), []byte(SALT), 4096, 32, sha1.New)
+		log.Println("key derivation done")
 		var block kcp.BlockCrypt
 		switch config.Crypt {
+		case "null":
+			block = nil
 		case "sm4":
 			block, _ = kcp.NewSM4BlockCrypt(pass[:16])
 		case "tea":
@@ -468,36 +533,10 @@ func main() {
 			block, _ = kcp.NewAESBlockCrypt(pass)
 		}
 
-		log_init()
-
-		log.Println("listening on:", listener.Addr())
-		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
-		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
-		log.Println("compression:", !config.NoComp)
-		log.Println("mtu:", config.MTU)
-		log.Println("datashard:", config.DataShard, "parityshard:", config.ParityShard)
-		log.Println("acknodelay:", config.AckNodelay)
-		log.Println("dscp:", config.DSCP)
-		log.Println("sockbuf:", config.SockBuf)
-		log.Println("keepalive:", config.KeepAlive)
-		log.Println("conn:", config.Conn)
-		log.Println("autoexpire:", config.AutoExpire)
-		log.Println("scavengettl:", config.ScavengeTTL)
-		log.Println("snmplog:", config.SnmpLog)
-		log.Println("snmpperiod:", config.SnmpPeriod)
-		log.Println("quiet:", config.Quiet)
-		log.Println("vpn:", config.Vpn)
-
-		VpnMode = config.Vpn
-
-		smuxConfig := smux.DefaultConfig()
-		smuxConfig.MaxReceiveBuffer = config.SockBuf
-		smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
-
 		createConn := func() (*smux.Session, error) {
-			kcpconn, err := DialKCP(config.RemoteAddr, block, config.DataShard, config.ParityShard)
+			kcpconn, err := DialKCP(config, block)
 			if err != nil {
-				return nil, errors.Wrap(err, "createConn()")
+				return nil, errors.Wrap(err, "dial()")
 			}
 			kcpconn.SetStreamMode(true)
 			kcpconn.SetWriteDelay(false)
@@ -515,18 +554,27 @@ func main() {
 			if err := kcpconn.SetWriteBuffer(config.SockBuf); err != nil {
 				log.Println("SetWriteBuffer:", err)
 			}
+			log.Println("smux version:", config.SmuxVer, "on connection:", kcpconn.LocalAddr(), "->", kcpconn.RemoteAddr())
+			smuxConfig := smux.DefaultConfig()
+			smuxConfig.Version = config.SmuxVer
+			smuxConfig.MaxReceiveBuffer = config.SmuxBuf
+			smuxConfig.MaxStreamBuffer = config.StreamBuf
+			smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
+
+			if err := smux.VerifyConfig(smuxConfig); err != nil {
+				log.Fatalf("%+v", err)
+			}
 
 			// stream multiplex
 			var session *smux.Session
 			if config.NoComp {
 				session, err = smux.Client(kcpconn, smuxConfig)
 			} else {
-				session, err = smux.Client(newCompStream(kcpconn), smuxConfig)
+				session, err = smux.Client(generic.NewCompStream(kcpconn), smuxConfig)
 			}
 			if err != nil {
 				return nil, errors.Wrap(err, "createConn()")
 			}
-			log.Println("connection:", kcpconn.LocalAddr(), "->", kcpconn.RemoteAddr())
 			return session, nil
 		}
 
@@ -542,35 +590,35 @@ func main() {
 			}
 		}
 
-		numconn := uint16(config.Conn)
-		muxes := make([]struct {
-			session *smux.Session
-			ttl     time.Time
-		}, numconn)
+		// start snmp logger
+		go generic.SnmpLogger(config.SnmpLog, config.SnmpPeriod)
 
-		for k := range muxes {
-			muxes[k].session = waitConn()
-			muxes[k].ttl = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
-		}
+		// start scavenger
+		chScavenger := make(chan timedSession, 128)
+		go scavenger(chScavenger, &config)
 
-		chScavenger := make(chan *smux.Session, 128)
-		go scavenger(chScavenger, config.ScavengeTTL)
-		go snmpLogger(config.SnmpLog, config.SnmpPeriod)
+		// start parent process monitor
 		go parentMonitor(3)
+
+		// start listener
+		numconn := uint16(config.Conn)
+		muxes := make([]timedSession, numconn)
 		rr := uint16(0)
 		for {
 			p1, err := listener.AcceptTCP()
 			if err != nil {
-				log.Fatalln(err)
+				log.Fatalf("%+v", err)
 			}
-			checkError(err)
 			idx := rr % numconn
 
 			// do auto expiration && reconnection
-			if muxes[idx].session.IsClosed() || (config.AutoExpire > 0 && time.Now().After(muxes[idx].ttl)) {
-				chScavenger <- muxes[idx].session
+			if muxes[idx].session == nil || muxes[idx].session.IsClosed() ||
+				(config.AutoExpire > 0 && time.Now().After(muxes[idx].expiryDate)) {
 				muxes[idx].session = waitConn()
-				muxes[idx].ttl = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
+				muxes[idx].expiryDate = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
+				if config.AutoExpire > 0 { // only when autoexpire set
+					chScavenger <- muxes[idx]
+				}
 			}
 
 			go handleClient(muxes[idx].session, p1, config.Quiet)
@@ -579,15 +627,6 @@ func main() {
 	}
 	myApp.Run(os.Args)
 }
-
-type scavengeSession struct {
-	session *smux.Session
-	ts      time.Time
-}
-
-const (
-	maxScavengeTTL = 10 * time.Minute
-)
 
 func parentMonitor(interval int) {
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
@@ -604,64 +643,40 @@ func parentMonitor(interval int) {
 	}
 }
 
-func scavenger(ch chan *smux.Session, ttl int) {
+func scavenger(ch chan timedSession, config *Config) {
+	// When AutoExpire is set to 0 (default), sessionList will keep empty.
+	// Then this routine won't need to do anything; thus just terminate it.
+	if config.AutoExpire <= 0 {
+		return
+	}
+
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	var sessionList []scavengeSession
+	var sessionList []timedSession
 	for {
 		select {
-		case sess := <-ch:
-			sessionList = append(sessionList, scavengeSession{sess, time.Now()})
-			log.Println("session marked as expired")
+		case item := <-ch:
+			sessionList = append(sessionList, timedSession{
+				item.session,
+				item.expiryDate.Add(time.Duration(config.ScavengeTTL) * time.Second)})
 		case <-ticker.C:
-			var newList []scavengeSession
+			if len(sessionList) == 0 {
+				continue
+			}
+
+			var newList []timedSession
 			for k := range sessionList {
 				s := sessionList[k]
-				if s.session.NumStreams() == 0 || s.session.IsClosed() {
-					log.Println("session normally closed")
+				if s.session.IsClosed() {
+					log.Println("scavenger: session normally closed:", s.session.LocalAddr())
+				} else if time.Now().After(s.expiryDate) {
 					s.session.Close()
-				} else if ttl >= 0 && time.Since(s.ts) >= time.Duration(ttl)*time.Second {
-					log.Println("session reached scavenge ttl")
-					s.session.Close()
+					log.Println("scavenger: session closed due to ttl:", s.session.LocalAddr())
 				} else {
 					newList = append(newList, sessionList[k])
 				}
 			}
 			sessionList = newList
-		}
-	}
-}
-
-func snmpLogger(path string, interval int) {
-	if path == "" || interval == 0 {
-		return
-	}
-	ticker := time.NewTicker(time.Duration(interval) * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			// split path into dirname and filename
-			logdir, logfile := filepath.Split(path)
-			// only format logfile
-			f, err := os.OpenFile(logdir+time.Now().Format(logfile), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			w := csv.NewWriter(f)
-			// write header in empty file
-			if stat, err := f.Stat(); err == nil && stat.Size() == 0 {
-				if err := w.Write(append([]string{"Unix"}, kcp.DefaultSnmp.Header()...)); err != nil {
-					log.Println(err)
-				}
-			}
-			if err := w.Write(append([]string{fmt.Sprint(time.Now().Unix())}, kcp.DefaultSnmp.ToSlice()...)); err != nil {
-				log.Println(err)
-			}
-			kcp.DefaultSnmp.Reset()
-			w.Flush()
-			f.Close()
 		}
 	}
 }

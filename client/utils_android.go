@@ -67,11 +67,11 @@ set_timeout(int sock)
 import "C"
 
 import (
-    "log"
-    "net"
-	"syscall"
 	"github.com/pkg/errors"
-	"github.com/xtaci/kcp-go"
+	"github.com/xtaci/kcp-go/v5"
+	"log"
+	"net"
+	"syscall"
 )
 
 func ControlOnConnSetup(network string, address string, c syscall.RawConn) error {
@@ -126,16 +126,16 @@ type connectedUDPConn struct{ *net.UDPConn }
 // WriteTo redirects all writes to the Write syscall, which is 4 times faster.
 func (c *connectedUDPConn) WriteTo(b []byte, addr net.Addr) (int, error) { return c.Write(b) }
 
-func DialKCP(raddr string, block kcp.BlockCrypt, dataShards, parityShards int) (*kcp.UDPSession, error) {
-    if !VpnMode {
-        return kcp.DialWithOptions(raddr, block, dataShards, parityShards)
-    }
+func DialKCP(config Config, block kcp.BlockCrypt) (*kcp.UDPSession, error) {
+	if !VpnMode {
+		return dial(&config, block)
+	}
 
-    d := net.Dialer{Control: ControlOnConnSetup}
-	udpconn, err := d.Dial("udp", raddr)
+	d := net.Dialer{Control: ControlOnConnSetup}
+	udpconn, err := d.Dial("udp", config.RemoteAddr)
 	if err != nil {
 		return nil, errors.Wrap(err, "net.DialUDP")
 	}
 
-	return kcp.NewConn(raddr, block, dataShards, parityShards, &connectedUDPConn{udpconn.(*net.UDPConn)})
+	return kcp.NewConn(config.RemoteAddr, block, config.DataShard, config.ParityShard, &connectedUDPConn{udpconn.(*net.UDPConn)})
 }
