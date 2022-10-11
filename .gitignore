@@ -26,3 +26,5 @@ client/client
 server/server
 build/*
 .DS_Store
+
+.idea
