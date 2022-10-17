@@ -1,3 +1,4 @@
+//go:build android
 // +build android
 
 package main
@@ -128,14 +129,22 @@ func (c *connectedUDPConn) WriteTo(b []byte, addr net.Addr) (int, error) { retur
 
 func DialKCP(config Config, block kcp.BlockCrypt) (*kcp.UDPSession, error) {
 	if !VpnMode {
-		return dial(&config, block)
+		return dial(&config, block, nil)
 	}
 
-	d := net.Dialer{Control: ControlOnConnSetup}
-	udpconn, err := d.Dial("udp", config.RemoteAddr)
-	if err != nil {
-		return nil, errors.Wrap(err, "net.DialUDP")
+	if config.TCP {
+		// TODO tcp 模式未验证
+		return dial(&config, block, nil)
 	}
 
-	return kcp.NewConn(config.RemoteAddr, block, config.DataShard, config.ParityShard, &connectedUDPConn{udpconn.(*net.UDPConn)})
+	createUDPConn := func(remoteAddr string) (net.PacketConn, error) {
+		d := net.Dialer{Control: ControlOnConnSetup}
+		udpconn, err := d.Dial("udp", remoteAddr)
+		if err != nil {
+			return nil, errors.Wrap(err, "net.DialUDP")
+		}
+
+		return &connectedUDPConn{udpconn.(*net.UDPConn)}, nil
+	}
+	return dial(&config, block, createUDPConn)
 }
