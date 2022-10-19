@@ -534,7 +534,7 @@ func main() {
 		}
 
 		createConn := func() (*smux.Session, error) {
-			kcpconn, err := DialKCP(config, block)
+			kcpconn, err := DialKCP(&config, block)
 			if err != nil {
 				return nil, errors.Wrap(err, "dial()")
 			}

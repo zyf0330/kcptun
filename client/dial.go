@@ -12,8 +12,11 @@ import (
 
 var dialCount uint64
 
-// createConn: optional
-func dial(config *Config, block kcp.BlockCrypt, createConn func(remoteAddr string) (net.PacketConn, error)) (*kcp.UDPSession, error) {
+type ConnProvider struct {
+	createConn func(isTCP bool, remoteAddr string) (net.PacketConn, error)
+}
+
+func dial(config *Config, block kcp.BlockCrypt, connProvider *ConnProvider) (*kcp.UDPSession, error) {
 	defer func() {
 		dialCount++
 	}()
@@ -27,8 +30,8 @@ func dial(config *Config, block kcp.BlockCrypt, createConn func(remoteAddr strin
 
 	if config.TCP {
 		var tcpConn net.PacketConn
-		if createConn != nil {
-			if conn, err := createConn(remoteAddr); err != nil {
+		if connProvider.createConn != nil {
+			if conn, err := connProvider.createConn(true, remoteAddr); err != nil {
 				return nil, errors.Wrap(err, "tcp createConn()")
 			} else {
 				tcpConn = conn
@@ -43,8 +46,8 @@ func dial(config *Config, block kcp.BlockCrypt, createConn func(remoteAddr strin
 		return kcp.NewConn(remoteAddr, block, config.DataShard, config.ParityShard, tcpConn)
 	}
 
-	if createConn != nil {
-		if c, err := createConn(remoteAddr); err != nil {
+	if connProvider.createConn != nil {
+		if c, err := connProvider.createConn(false, remoteAddr); err != nil {
 			return nil, err
 		} else {
 			return kcp.NewConn(remoteAddr, block, config.DataShard, config.ParityShard, c)

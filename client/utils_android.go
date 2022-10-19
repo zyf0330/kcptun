@@ -127,17 +127,10 @@ type connectedUDPConn struct{ *net.UDPConn }
 // WriteTo redirects all writes to the Write syscall, which is 4 times faster.
 func (c *connectedUDPConn) WriteTo(b []byte, addr net.Addr) (int, error) { return c.Write(b) }
 
-func DialKCP(config Config, block kcp.BlockCrypt) (*kcp.UDPSession, error) {
-	if !VpnMode {
-		return dial(&config, block, nil)
-	}
-
-	if config.TCP {
-		// TODO tcp 模式未验证
-		return dial(&config, block, nil)
-	}
-
-	createUDPConn := func(remoteAddr string) (net.PacketConn, error) {
+func createConn(isTCP bool, remoteAddr string) (net.PacketConn, error) {
+	if isTCP {
+		return nil, errors.New("doesn't support create TCP conn")
+	} else {
 		d := net.Dialer{Control: ControlOnConnSetup}
 		udpconn, err := d.Dial("udp", remoteAddr)
 		if err != nil {
@@ -146,5 +139,17 @@ func DialKCP(config Config, block kcp.BlockCrypt) (*kcp.UDPSession, error) {
 
 		return &connectedUDPConn{udpconn.(*net.UDPConn)}, nil
 	}
-	return dial(&config, block, createUDPConn)
+}
+
+func DialKCP(config *Config, block kcp.BlockCrypt) (*kcp.UDPSession, error) {
+	if !VpnMode {
+		return dial(config, block, &ConnProvider{})
+	}
+
+	if config.TCP {
+		// TODO tcp 模式未验证
+		return dial(config, block, &ConnProvider{})
+	}
+
+	return dial(config, block, &ConnProvider{createConn})
 }
