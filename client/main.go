@@ -101,7 +101,7 @@ func main() {
 		cli.StringFlag{
 			Name:  "remoteaddr, r",
 			Value: "vps:29900",
-			Usage: "kcp server address",
+			Usage: `kcp server address, eg: "IP:29900" a for single port, "IP:minport-maxport" for port range`,
 		},
 		cli.StringFlag{
 			Name:   "key",
@@ -459,10 +459,22 @@ func main() {
 		}
 
 		log.Println("version:", VERSION)
-		addr, err := net.ResolveTCPAddr("tcp", config.LocalAddr)
-		checkError(err)
-		listener, err := net.ListenTCP("tcp", addr)
-		checkError(err)
+		var listener net.Listener
+		var isUnix bool
+		if _, _, err := net.SplitHostPort(config.LocalAddr); err != nil {
+			isUnix = true
+		}
+		if isUnix {
+			addr, err := net.ResolveUnixAddr("unix", config.LocalAddr)
+			checkError(err)
+			listener, err = net.ListenUnix("unix", addr)
+			checkError(err)
+		} else {
+			addr, err := net.ResolveTCPAddr("tcp", config.LocalAddr)
+			checkError(err)
+			listener, err = net.ListenTCP("tcp", addr)
+			checkError(err)
+		}
 
 		log_init()
 
@@ -605,7 +617,7 @@ func main() {
 		muxes := make([]timedSession, numconn)
 		rr := uint16(0)
 		for {
-			p1, err := listener.AcceptTCP()
+			p1, err := listener.Accept()
 			if err != nil {
 				log.Fatalf("%+v", err)
 			}

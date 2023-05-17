@@ -134,7 +134,7 @@ func main() {
 		cli.StringFlag{
 			Name:  "listen,l",
 			Value: ":29900",
-			Usage: "kcp server listen address",
+			Usage: `kcp server listen address, eg: "IP:29900" for a single port, "IP:minport-maxport" for port range`,
 		},
 		cli.StringFlag{
 			Name:  "target, t",
