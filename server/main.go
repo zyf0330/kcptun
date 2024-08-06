@@ -1,3 +1,25 @@
+// The MIT License (MIT)
+//
+// # Copyright (c) 2016 xtaci
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 package main
 
 import (
@@ -5,7 +27,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	"math/big"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -16,9 +38,11 @@ import (
 
 	"golang.org/x/crypto/pbkdf2"
 
+	"github.com/fatih/color"
 	"github.com/urfave/cli"
 	kcp "github.com/xtaci/kcp-go/v5"
-	"github.com/xtaci/kcptun/generic"
+	"github.com/xtaci/kcptun/std"
+	"github.com/xtaci/qpp"
 	"github.com/xtaci/smux"
 	"github.com/xtaci/tcpraw"
 )
@@ -28,99 +52,17 @@ const (
 	SALT = "kcp-go"
 	// maximum supported smux version
 	maxSmuxVer = 2
-	// stream copy buffer size
-	bufSize = 4096
+)
+
+const (
+	TGT_UNIX = iota
+	TGT_TCP
 )
 
 // VERSION is injected by buildflags
 var VERSION = "SELFBUILD"
 
-// handle multiplex-ed connection
-func handleMux(conn net.Conn, config *Config) {
-	// check if target is unix domain socket
-	var isUnix bool
-	if _, _, err := net.SplitHostPort(config.Target); err != nil {
-		isUnix = true
-	}
-	log.Println("smux version:", config.SmuxVer, "on connection:", conn.LocalAddr(), "->", conn.RemoteAddr())
-
-	// stream multiplex
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = config.SmuxVer
-	smuxConfig.MaxReceiveBuffer = config.SmuxBuf
-	smuxConfig.MaxStreamBuffer = config.StreamBuf
-	smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
-
-	mux, err := smux.Server(conn, smuxConfig)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	defer mux.Close()
-
-	for {
-		stream, err := mux.AcceptStream()
-		if err != nil {
-			log.Println(err)
-			return
-		}
-
-		go func(p1 *smux.Stream) {
-			var p2 net.Conn
-			var err error
-			if !isUnix {
-				p2, err = net.Dial("tcp", config.Target)
-			} else {
-				p2, err = net.Dial("unix", config.Target)
-			}
-
-			if err != nil {
-				log.Println(err)
-				p1.Close()
-				return
-			}
-			handleClient(p1, p2, config.Quiet)
-		}(stream)
-	}
-}
-
-func handleClient(p1 *smux.Stream, p2 net.Conn, quiet bool) {
-	logln := func(v ...interface{}) {
-		if !quiet {
-			log.Println(v...)
-		}
-	}
-
-	defer p1.Close()
-	defer p2.Close()
-
-	logln("stream opened", "in:", fmt.Sprint(p1.RemoteAddr(), "(", p1.ID(), ")"), "out:", p2.RemoteAddr())
-	defer logln("stream closed", "in:", fmt.Sprint(p1.RemoteAddr(), "(", p1.ID(), ")"), "out:", p2.RemoteAddr())
-
-	// start tunnel & wait for tunnel termination
-	streamCopy := func(dst io.Writer, src io.ReadCloser) {
-		if _, err := generic.Copy(dst, src); err != nil {
-			if err == smux.ErrInvalidProtocol {
-				log.Println("smux", err, "in:", fmt.Sprint(p1.RemoteAddr(), "(", p1.ID(), ")"), "out:", p2.RemoteAddr())
-			}
-		}
-		p1.Close()
-		p2.Close()
-	}
-
-	go streamCopy(p2, p1)
-	streamCopy(p1, p2)
-}
-
-func checkError(err error) {
-	if err != nil {
-		log.Printf("%+v\n", err)
-		os.Exit(-1)
-	}
-}
-
 func main() {
-	rand.Seed(int64(time.Now().Nanosecond()))
 	if VERSION == "SELFBUILD" {
 		// add more log flags for debugging
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -152,6 +94,16 @@ func main() {
 			Value: "aes",
 			Usage: "aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none, null",
 		},
+		cli.BoolFlag{
+			Name:  "QPP",
+			Usage: "enable Quantum Permutation Pads(QPP)",
+		},
+		cli.IntFlag{
+			Name:  "QPPCount",
+			Value: 61,
+			Usage: "the prime number of pads to use for QPP: The more pads you use, the more secure the encryption. Each pad requires 256 bytes.",
+		},
+
 		cli.StringFlag{
 			Name:  "mode",
 			Value: "fast",
@@ -304,6 +256,8 @@ func main() {
 		config.Pprof = c.Bool("pprof")
 		config.Quiet = c.Bool("quiet")
 		config.TCP = c.Bool("tcp")
+		config.QPP = c.Bool("QPP")
+		config.QPPCount = c.Int("QPPCount")
 
 		if c.String("c") != "" {
 			//Now only support json config file
@@ -439,6 +393,16 @@ func main() {
 					config.TCP = tcp
 				}
 			}
+			if c, b := opts.Get("qpp"); b {
+				if qpp, err := strconv.ParseBool(c); err == nil {
+					config.QPP = qpp
+				}
+			}
+			if c, b := opts.Get("qppcount"); b {
+				if qppcount, err := strconv.Atoi(c); err == nil {
+					config.QPPCount = qppcount
+				}
+			}
 		}
 
 		// log redirect
@@ -482,6 +446,21 @@ func main() {
 		log.Println("quiet:", config.Quiet)
 		log.Println("tcp:", config.TCP)
 
+		if config.QPP {
+			minSeedLength := qpp.QPPMinimumSeedLength(8)
+			if len(config.Key) < minSeedLength {
+				color.Red("QPP Warning: 'key' has size of %d bytes, required %d bytes at least", len(config.Key), minSeedLength)
+			}
+
+			minPads := qpp.QPPMinimumPads(8)
+			if config.QPPCount < minPads {
+				color.Red("QPP Warning: QPPCount %d, required %d at least", config.QPPCount, minPads)
+			}
+
+			if new(big.Int).GCD(nil, nil, big.NewInt(int64(config.QPPCount)), big.NewInt(8)).Int64() != 1 {
+				color.Red("QPP Warning: QPPCount %d, choose a prime number for security", config.QPPCount)
+			}
+		}
 		// parameters check
 		if config.SmuxVer > maxSmuxVer {
 			log.Fatal("unsupported smux version:", config.SmuxVer)
@@ -523,9 +502,15 @@ func main() {
 			block, _ = kcp.NewAESBlockCrypt(pass)
 		}
 
-		go generic.SnmpLogger(config.SnmpLog, config.SnmpPeriod)
+		go std.SnmpLogger(config.SnmpLog, config.SnmpPeriod)
 		if config.Pprof {
 			go http.ListenAndServe(":6060", nil)
+		}
+
+		// create shared QPP
+		var _Q_ *qpp.QuantumPermutationPad
+		if config.QPP {
+			_Q_ = qpp.NewQPP([]byte(config.Key), uint16(config.QPPCount))
 		}
 
 		go parentMonitor(3)
@@ -555,9 +540,9 @@ func main() {
 					conn.SetACKNoDelay(config.AckNodelay)
 
 					if config.NoComp {
-						go handleMux(conn, &config)
+						go handleMux(_Q_, conn, &config)
 					} else {
-						go handleMux(generic.NewCompStream(conn), &config)
+						go handleMux(_Q_, std.NewCompStream(conn), &config)
 					}
 				} else {
 					log.Printf("%+v", err)
@@ -565,7 +550,7 @@ func main() {
 			}
 		}
 
-		mp, err := generic.ParseMultiPort(config.Listen)
+		mp, err := std.ParseMultiPort(config.Listen)
 		if err != nil {
 			log.Println(err)
 			return err
@@ -599,6 +584,7 @@ func main() {
 	}
 	myApp.Run(os.Args)
 }
+
 func parentMonitor(interval int) {
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
@@ -611,5 +597,102 @@ func parentMonitor(interval int) {
 				os.Exit(1)
 			}
 		}
+	}
+}
+
+// handle multiplex-ed connection
+func handleMux(_Q_ *qpp.QuantumPermutationPad, conn net.Conn, config *Config) {
+	// check target type
+	targetType := TGT_TCP
+	if _, _, err := net.SplitHostPort(config.Target); err != nil {
+		targetType = TGT_UNIX
+	}
+	log.Println("smux version:", config.SmuxVer, "on connection:", conn.LocalAddr(), "->", conn.RemoteAddr())
+
+	// stream multiplex
+	smuxConfig := smux.DefaultConfig()
+	smuxConfig.Version = config.SmuxVer
+	smuxConfig.MaxReceiveBuffer = config.SmuxBuf
+	smuxConfig.MaxStreamBuffer = config.StreamBuf
+	smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
+
+	mux, err := smux.Server(conn, smuxConfig)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	defer mux.Close()
+
+	for {
+		stream, err := mux.AcceptStream()
+		if err != nil {
+			log.Println(err)
+			return
+		}
+
+		go func(p1 *smux.Stream) {
+			var p2 net.Conn
+			var err error
+
+			switch targetType {
+			case TGT_TCP:
+				p2, err = net.Dial("tcp", config.Target)
+				if err != nil {
+					log.Println(err)
+					p1.Close()
+					return
+				}
+				handleClient(_Q_, []byte(config.Key), p1, p2, config.Quiet)
+			case TGT_UNIX:
+				p2, err = net.Dial("unix", config.Target)
+				if err != nil {
+					log.Println(err)
+					p1.Close()
+					return
+				}
+				handleClient(_Q_, []byte(config.Key), p1, p2, config.Quiet)
+			}
+
+		}(stream)
+	}
+}
+
+// handleClient pipes two streams
+func handleClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, p1 *smux.Stream, p2 net.Conn, quiet bool) {
+	logln := func(v ...interface{}) {
+		if !quiet {
+			log.Println(v...)
+		}
+	}
+
+	defer p1.Close()
+	defer p2.Close()
+
+	logln("stream opened", "in:", fmt.Sprint(p1.RemoteAddr(), "(", p1.ID(), ")"), "out:", p2.RemoteAddr())
+	defer logln("stream closed", "in:", fmt.Sprint(p1.RemoteAddr(), "(", p1.ID(), ")"), "out:", p2.RemoteAddr())
+
+	var s1, s2 io.ReadWriteCloser = p1, p2
+	// if QPP is enabled, create QPP read write closer
+	if _Q_ != nil {
+		// replace s1 with QPP port
+		s1 = std.NewQPPPort(p1, _Q_, seed)
+	}
+
+	// stream layer
+	err1, err2 := std.Pipe(s1, s2)
+
+	// handles transport layer errors
+	if err1 != nil && err1 != io.EOF {
+		logln("pipe:", err1, "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.RemoteAddr(), ")"))
+	}
+	if err2 != nil && err2 != io.EOF {
+		logln("pipe:", err2, "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.RemoteAddr(), ")"))
+	}
+}
+
+func checkError(err error) {
+	if err != nil {
+		log.Printf("%+v\n", err)
+		os.Exit(-1)
 	}
 }
