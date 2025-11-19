@@ -34,12 +34,12 @@ import (
 	"github.com/xtaci/tcpraw"
 )
 
-type ConnProvider struct {
-	createConn func(isTCP bool, remoteAddr string) (net.PacketConn, error)
+type UDPConnProvider struct {
+	createConn func(remoteAddr string) (net.PacketConn, error)
 }
 
 // dial connects to the remote address
-func dial(config *Config, block kcp.BlockCrypt, connProvider *ConnProvider) (*kcp.UDPSession, error) {
+func dial(config *Config, block kcp.BlockCrypt, udpConnProvider *UDPConnProvider) (*kcp.UDPSession, error) {
 	mp, err := std.ParseMultiPort(config.RemoteAddr)
 	if err != nil {
 		return nil, err
@@ -55,31 +55,29 @@ func dial(config *Config, block kcp.BlockCrypt, connProvider *ConnProvider) (*kc
 
 	// emulate TCP connection
 	if config.TCP {
-		var tcpConn net.PacketConn
-		if connProvider.createConn != nil {
-			if conn, err := connProvider.createConn(true, remoteAddr); err != nil {
-				return nil, errors.Wrap(err, "tcp createConn()")
-			} else {
-				tcpConn = conn
-			}
-		} else {
-			if conn, err := tcpraw.Dial("tcp", remoteAddr); err != nil {
-				return nil, errors.Wrap(err, "tcpraw.Dial()")
-			} else {
-				tcpConn = conn
-			}
+		conn, err := tcpraw.Dial("tcp", remoteAddr)
+		if err != nil {
+			return nil, errors.Wrap(err, "tcpraw.Dial()")
 		}
-		return kcp.NewConn(remoteAddr, block, config.DataShard, config.ParityShard, tcpConn)
+
+		udpaddr, err := net.ResolveUDPAddr("udp", remoteAddr)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		var convid uint32
+		binary.Read(rand.Reader, binary.LittleEndian, &convid)
+		return kcp.NewConn4(convid, udpaddr, block, config.DataShard, config.ParityShard, true, conn)
 	}
 
-	if connProvider.createConn != nil {
-		if c, err := connProvider.createConn(false, remoteAddr); err != nil {
+	if udpConnProvider.createConn != nil {
+		if c, err := udpConnProvider.createConn(remoteAddr); err != nil {
 			return nil, err
 		} else {
 			return kcp.NewConn(remoteAddr, block, config.DataShard, config.ParityShard, c)
 		}
 	} else {
-	    // default UDP connection
+		// default UDP connection
 		return kcp.DialWithOptions(remoteAddr, block, config.DataShard, config.ParityShard)
 	}
 }

@@ -26,5 +26,6 @@ client/client
 server/server
 build/*
 .DS_Store
+*Zone.Identifier
 
 .idea

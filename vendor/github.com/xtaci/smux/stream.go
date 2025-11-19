@@ -31,27 +31,32 @@ import (
 	"time"
 )
 
-// Stream implements net.Conn
+// wrapper for GC
 type Stream struct {
-	id   uint32
+	*stream
+}
+
+// Stream implements net.Conn
+type stream struct {
+	id   uint32 // Stream identifier
 	sess *Session
 
-	buffers [][]byte // the sequential buffers of stream
-	heads   [][]byte // slice heads of the buffers above, kept for recycle
+	buffers []*[]byte // the sequential buffers of stream
+	heads   []*[]byte // slice heads of the buffers above, kept for recycle
 
-	bufferLock sync.Mutex
-	frameSize  int
+	bufferLock sync.Mutex // Mutex to protect access to buffers
+	frameSize  int        // Maximum frame size for the stream
 
 	// notify a read event
 	chReadEvent chan struct{}
 
 	// flag the stream has closed
 	die     chan struct{}
-	dieOnce sync.Once
+	dieOnce sync.Once // Ensures die channel is closed only once
 
 	// FIN command
 	chFinEvent   chan struct{}
-	finEventOnce sync.Once
+	finEventOnce sync.Once // Ensures chFinEvent is closed only once
 
 	// deadlines
 	readDeadline  atomic.Value
@@ -68,9 +73,9 @@ type Stream struct {
 	chUpdate     chan struct{} // notify of remote data consuming and window update
 }
 
-// newStream initiates a Stream struct
-func newStream(id uint32, frameSize int, sess *Session) *Stream {
-	s := new(Stream)
+// newStream initializes and returns a new Stream.
+func newStream(id uint32, frameSize int, sess *Session) *stream {
+	s := new(stream)
 	s.id = id
 	s.chReadEvent = make(chan struct{}, 1)
 	s.chUpdate = make(chan struct{}, 1)
@@ -79,16 +84,17 @@ func newStream(id uint32, frameSize int, sess *Session) *Stream {
 	s.die = make(chan struct{})
 	s.chFinEvent = make(chan struct{})
 	s.peerWindow = initialPeerWindow // set to initial window size
+
 	return s
 }
 
-// ID returns the unique stream ID.
-func (s *Stream) ID() uint32 {
+// ID returns the stream's unique identifier.
+func (s *stream) ID() uint32 {
 	return s.id
 }
 
-// Read implements net.Conn
-func (s *Stream) Read(b []byte) (n int, err error) {
+// Read reads data from the stream into the provided buffer.
+func (s *stream) Read(b []byte) (n int, err error) {
 	for {
 		n, err = s.tryRead(b)
 		if err == ErrWouldBlock {
@@ -101,8 +107,8 @@ func (s *Stream) Read(b []byte) (n int, err error) {
 	}
 }
 
-// tryRead is the nonblocking version of Read
-func (s *Stream) tryRead(b []byte) (n int, err error) {
+// tryRead attempts to read data from the stream without blocking.
+func (s *stream) tryRead(b []byte) (n int, err error) {
 	if s.sess.config.Version == 2 {
 		return s.tryReadv2(b)
 	}
@@ -114,9 +120,10 @@ func (s *Stream) tryRead(b []byte) (n int, err error) {
 	// A critical section to copy data from buffers to
 	s.bufferLock.Lock()
 	if len(s.buffers) > 0 {
-		n = copy(b, s.buffers[0])
-		s.buffers[0] = s.buffers[0][n:]
-		if len(s.buffers[0]) == 0 {
+		n = copy(b, *s.buffers[0])
+		s.buffers[0] = s.buffers[0]
+		*s.buffers[0] = (*s.buffers[0])[n:]
+		if len(*s.buffers[0]) == 0 {
 			s.buffers[0] = nil
 			s.buffers = s.buffers[1:]
 			// full recycle
@@ -139,7 +146,8 @@ func (s *Stream) tryRead(b []byte) (n int, err error) {
 	}
 }
 
-func (s *Stream) tryReadv2(b []byte) (n int, err error) {
+// tryReadv2 is the non-blocking version of Read for version 2 streams.
+func (s *stream) tryReadv2(b []byte) (n int, err error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
@@ -147,9 +155,10 @@ func (s *Stream) tryReadv2(b []byte) (n int, err error) {
 	var notifyConsumed uint32
 	s.bufferLock.Lock()
 	if len(s.buffers) > 0 {
-		n = copy(b, s.buffers[0])
-		s.buffers[0] = s.buffers[0][n:]
-		if len(s.buffers[0]) == 0 {
+		n = copy(b, *s.buffers[0])
+		s.buffers[0] = s.buffers[0]
+		*s.buffers[0] = (*s.buffers[0])[n:]
+		if len(*s.buffers[0]) == 0 {
 			s.buffers[0] = nil
 			s.buffers = s.buffers[1:]
 			// full recycle
@@ -201,25 +210,26 @@ func (s *Stream) tryReadv2(b []byte) (n int, err error) {
 // WriteTo calls Write in a loop until there is no more data to write or when an error occurs.
 // If the underlying stream is a v2 stream, it will send window update to peer when necessary.
 // If the underlying stream is a v1 stream, it will not send window update to peer.
-func (s *Stream) WriteTo(w io.Writer) (n int64, err error) {
+func (s *stream) WriteTo(w io.Writer) (n int64, err error) {
 	if s.sess.config.Version == 2 {
 		return s.writeTov2(w)
 	}
 
 	for {
-		var buf []byte
+		var pbuf *[]byte
 		s.bufferLock.Lock()
 		if len(s.buffers) > 0 {
-			buf = s.buffers[0]
+			pbuf = s.buffers[0]
 			s.buffers = s.buffers[1:]
 			s.heads = s.heads[1:]
 		}
 		s.bufferLock.Unlock()
 
-		if buf != nil {
-			nw, ew := w.Write(buf)
-			s.sess.returnTokens(len(buf))
-			defaultAllocator.Put(buf)
+		if pbuf != nil {
+			nw, ew := w.Write(*pbuf)
+			// NOTE: WriteTo is a reader, so we need to return tokens here
+			s.sess.returnTokens(len(*pbuf))
+			defaultAllocator.Put(pbuf)
 			if nw > 0 {
 				n += int64(nw)
 			}
@@ -234,28 +244,33 @@ func (s *Stream) WriteTo(w io.Writer) (n int64, err error) {
 }
 
 // check comments in WriteTo
-func (s *Stream) writeTov2(w io.Writer) (n int64, err error) {
+func (s *stream) writeTov2(w io.Writer) (n int64, err error) {
 	for {
 		var notifyConsumed uint32
-		var buf []byte
+		var pbuf *[]byte
 		s.bufferLock.Lock()
 		if len(s.buffers) > 0 {
-			buf = s.buffers[0]
+			pbuf = s.buffers[0]
 			s.buffers = s.buffers[1:]
 			s.heads = s.heads[1:]
 		}
-		s.numRead += uint32(len(buf))
-		s.incr += uint32(len(buf))
-		if s.incr >= uint32(s.sess.config.MaxStreamBuffer/2) || s.numRead == uint32(len(buf)) {
+		var bufLen uint32
+		if pbuf != nil {
+			bufLen = uint32(len(*pbuf))
+		}
+		s.numRead += bufLen
+		s.incr += bufLen
+		if s.incr >= uint32(s.sess.config.MaxStreamBuffer/2) || s.numRead == bufLen {
 			notifyConsumed = s.numRead
 			s.incr = 0
 		}
 		s.bufferLock.Unlock()
 
-		if buf != nil {
-			nw, ew := w.Write(buf)
-			s.sess.returnTokens(len(buf))
-			defaultAllocator.Put(buf)
+		if pbuf != nil {
+			nw, ew := w.Write(*pbuf)
+			// NOTE: WriteTo is a reader, so we need to return tokens here
+			s.sess.returnTokens(len(*pbuf))
+			defaultAllocator.Put(pbuf)
 			if nw > 0 {
 				n += int64(nw)
 			}
@@ -275,7 +290,8 @@ func (s *Stream) writeTov2(w io.Writer) (n int64, err error) {
 	}
 }
 
-func (s *Stream) sendWindowUpdate(consumed uint32) error {
+// sendWindowUpdate sends a window update frame to the peer.
+func (s *stream) sendWindowUpdate(consumed uint32) error {
 	var timer *time.Timer
 	var deadline <-chan time.Time
 	if d, ok := s.readDeadline.Load().(time.Time); ok && !d.IsZero() {
@@ -293,8 +309,8 @@ func (s *Stream) sendWindowUpdate(consumed uint32) error {
 	return err
 }
 
-// waitRead blocks on a read event
-func (s *Stream) waitRead() error {
+// waitRead blocks until a read event occurs or a deadline is reached.
+func (s *stream) waitRead() error {
 	var timer *time.Timer
 	var deadline <-chan time.Time
 	if d, ok := s.readDeadline.Load().(time.Time); ok && !d.IsZero() {
@@ -330,7 +346,7 @@ func (s *Stream) waitRead() error {
 //
 // Note that the behavior when multiple goroutines write concurrently is not deterministic,
 // frames may interleave in random way.
-func (s *Stream) Write(b []byte) (n int, err error) {
+func (s *stream) Write(b []byte) (n int, err error) {
 	if s.sess.config.Version == 2 {
 		return s.writeV2(b)
 	}
@@ -344,6 +360,8 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 
 	// check if stream has closed
 	select {
+	case <-s.chFinEvent: // passive closing
+		return 0, io.EOF
 	case <-s.die:
 		return 0, io.ErrClosedPipe
 	default:
@@ -371,7 +389,8 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 	return sent, nil
 }
 
-func (s *Stream) writeV2(b []byte) (n int, err error) {
+// writeV2 writes data to the stream for version 2 streams.
+func (s *stream) writeV2(b []byte) (n int, err error) {
 	// check empty input
 	if len(b) == 0 {
 		return 0, nil
@@ -379,6 +398,8 @@ func (s *Stream) writeV2(b []byte) (n int, err error) {
 
 	// check if stream has closed
 	select {
+	case <-s.chFinEvent:
+		return 0, io.EOF
 	case <-s.die:
 		return 0, io.ErrClosedPipe
 	default:
@@ -468,7 +489,7 @@ func (s *Stream) writeV2(b []byte) (n int, err error) {
 }
 
 // Close implements net.Conn
-func (s *Stream) Close() error {
+func (s *stream) Close() error {
 	var once bool
 	var err error
 	s.dieOnce.Do(func() {
@@ -477,7 +498,13 @@ func (s *Stream) Close() error {
 	})
 
 	if once {
-		_, err = s.sess.writeFrame(newFrame(byte(s.sess.config.Version), cmdFIN, s.id))
+		// send FIN in order
+		f := newFrame(byte(s.sess.config.Version), cmdFIN, s.id)
+
+		timer := time.NewTimer(openCloseTimeout)
+		defer timer.Stop()
+
+		_, err = s.sess.writeFrameInternal(f, timer.C, CLSDATA)
 		s.sess.streamClosed(s.id)
 		return err
 	} else {
@@ -487,14 +514,14 @@ func (s *Stream) Close() error {
 
 // GetDieCh returns a readonly chan which can be readable
 // when the stream is to be closed.
-func (s *Stream) GetDieCh() <-chan struct{} {
+func (s *stream) GetDieCh() <-chan struct{} {
 	return s.die
 }
 
 // SetReadDeadline sets the read deadline as defined by
 // net.Conn.SetReadDeadline.
 // A zero time value disables the deadline.
-func (s *Stream) SetReadDeadline(t time.Time) error {
+func (s *stream) SetReadDeadline(t time.Time) error {
 	s.readDeadline.Store(t)
 	s.notifyReadEvent()
 	return nil
@@ -503,7 +530,7 @@ func (s *Stream) SetReadDeadline(t time.Time) error {
 // SetWriteDeadline sets the write deadline as defined by
 // net.Conn.SetWriteDeadline.
 // A zero time value disables the deadline.
-func (s *Stream) SetWriteDeadline(t time.Time) error {
+func (s *stream) SetWriteDeadline(t time.Time) error {
 	s.writeDeadline.Store(t)
 	return nil
 }
@@ -511,7 +538,7 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 // SetDeadline sets both read and write deadlines as defined by
 // net.Conn.SetDeadline.
 // A zero time value disables the deadlines.
-func (s *Stream) SetDeadline(t time.Time) error {
+func (s *stream) SetDeadline(t time.Time) error {
 	if err := s.SetReadDeadline(t); err != nil {
 		return err
 	}
@@ -522,10 +549,10 @@ func (s *Stream) SetDeadline(t time.Time) error {
 }
 
 // session closes
-func (s *Stream) sessionClose() { s.dieOnce.Do(func() { close(s.die) }) }
+func (s *stream) sessionClose() { s.dieOnce.Do(func() { close(s.die) }) }
 
 // LocalAddr satisfies net.Conn interface
-func (s *Stream) LocalAddr() net.Addr {
+func (s *stream) LocalAddr() net.Addr {
 	if ts, ok := s.sess.conn.(interface {
 		LocalAddr() net.Addr
 	}); ok {
@@ -535,7 +562,7 @@ func (s *Stream) LocalAddr() net.Addr {
 }
 
 // RemoteAddr satisfies net.Conn interface
-func (s *Stream) RemoteAddr() net.Addr {
+func (s *stream) RemoteAddr() net.Addr {
 	if ts, ok := s.sess.conn.(interface {
 		RemoteAddr() net.Addr
 	}); ok {
@@ -545,19 +572,19 @@ func (s *Stream) RemoteAddr() net.Addr {
 }
 
 // pushBytes append buf to buffers
-func (s *Stream) pushBytes(buf []byte) (written int, err error) {
+func (s *stream) pushBytes(pbuf *[]byte) (written int, err error) {
 	s.bufferLock.Lock()
-	s.buffers = append(s.buffers, buf)
-	s.heads = append(s.heads, buf)
+	s.buffers = append(s.buffers, pbuf)
+	s.heads = append(s.heads, pbuf)
 	s.bufferLock.Unlock()
 	return
 }
 
 // recycleTokens transform remaining bytes to tokens(will truncate buffer)
-func (s *Stream) recycleTokens() (n int) {
+func (s *stream) recycleTokens() (n int) {
 	s.bufferLock.Lock()
 	for k := range s.buffers {
-		n += len(s.buffers[k])
+		n += len(*s.buffers[k])
 		defaultAllocator.Put(s.heads[k])
 	}
 	s.buffers = nil
@@ -567,7 +594,7 @@ func (s *Stream) recycleTokens() (n int) {
 }
 
 // notify read event
-func (s *Stream) notifyReadEvent() {
+func (s *stream) notifyReadEvent() {
 	select {
 	case s.chReadEvent <- struct{}{}:
 	default:
@@ -575,7 +602,7 @@ func (s *Stream) notifyReadEvent() {
 }
 
 // update command
-func (s *Stream) update(consumed uint32, window uint32) {
+func (s *stream) update(consumed uint32, window uint32) {
 	atomic.StoreUint32(&s.peerConsumed, consumed)
 	atomic.StoreUint32(&s.peerWindow, window)
 	select {
@@ -585,7 +612,7 @@ func (s *Stream) update(consumed uint32, window uint32) {
 }
 
 // mark this stream has been closed in protocol
-func (s *Stream) fin() {
+func (s *stream) fin() {
 	s.finEventOnce.Do(func() {
 		close(s.chFinEvent)
 	})

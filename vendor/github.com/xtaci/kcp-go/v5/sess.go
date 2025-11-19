@@ -46,6 +46,7 @@
 package kcp
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"hash/crc32"
@@ -58,6 +59,7 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -76,21 +78,33 @@ const (
 	// accept backlog
 	acceptBacklog = 128
 
+	// dev backlog
+	devBacklog = 2048
+
 	// max latency for consecutive FEC encoding, in millisecond
 	maxFECEncodeLatency = 500
+
+	// max batch size
+	maxBatchSize = 64
 )
 
 var (
 	errInvalidOperation = errors.New("invalid operation")
-	errTimeout          = errors.New("timeout")
+	errTimeout          = timeoutError{}
+	errNotOwner         = errors.New("not the owner of this connection")
 )
 
-var (
-	// a system-wide packet buffer shared among sending, receiving and FEC
-	// to mitigate high-frequency memory allocation for packets, bytes from xmitBuf
-	// is aligned to 64bit
-	xmitBuf sync.Pool
-)
+// timeoutError implements net.Error
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+// a system-wide packet buffer shared among sending, receiving and FEC
+// to mitigate high-frequency memory allocation for packets, bytes from xmitBuf
+// is aligned to 64bit
+var xmitBuf sync.Pool
 
 func init() {
 	xmitBuf.New = func() interface{} {
@@ -117,13 +131,13 @@ type (
 		fecEncoder *fecEncoder
 
 		// settings
-		remote     net.Addr  // remote peer address
-		rd         time.Time // read deadline
-		wd         time.Time // write deadline
-		headerSize int       // the header size additional to a KCP frame
-		ackNoDelay bool      // send ack immediately for each incoming packet(testing purpose)
-		writeDelay bool      // delay kcp.flush() for Write() for bulk transfer
-		dup        int       // duplicate udp packets(testing purpose)
+		remote     net.Addr     // remote peer address
+		rd         atomic.Value // read deadline
+		wd         atomic.Value // write deadline
+		headerSize int          // the header size additional to a KCP frame
+		ackNoDelay bool         // send ack immediately for each incoming packet(testing purpose)
+		writeDelay bool         // delay kcp.flush() for Write() for bulk transfer
+		dup        int          // duplicate udp packets(testing purpose)
 
 		// notifications
 		die          chan struct{} // notify current session has Closed
@@ -147,6 +161,9 @@ type (
 
 		xconn           batchConn // for x/net
 		xconnWriteError error
+
+		// rate limiter (bytes per second)
+		rateLimiter atomic.Value
 
 		mu sync.Mutex
 	}
@@ -174,7 +191,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	sess.chWriteEvent = make(chan struct{}, 1)
 	sess.chSocketReadError = make(chan struct{})
 	sess.chSocketWriteError = make(chan struct{})
-	sess.chPostProcessing = make(chan []byte, acceptBacklog)
+	sess.chPostProcessing = make(chan []byte, devBacklog)
 	sess.remote = remote
 	sess.conn = conn
 	sess.ownConn = ownConn
@@ -256,9 +273,8 @@ RESET_TIMER:
 	var timeout *time.Timer
 	// deadline for current reading operation
 	var c <-chan time.Time
-	if !s.rd.IsZero() {
-		delay := time.Until(s.rd)
-		timeout = time.NewTimer(delay)
+	if trd, ok := s.rd.Load().(time.Time); ok && !trd.IsZero() {
+		timeout = time.NewTimer(time.Until(trd))
 		c = timeout.C
 		defer timeout.Stop()
 	}
@@ -332,9 +348,8 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 RESET_TIMER:
 	var timeout *time.Timer
 	var c <-chan time.Time
-	if !s.wd.IsZero() {
-		delay := time.Until(s.wd)
-		timeout = time.NewTimer(delay)
+	if twd, ok := s.rd.Load().(time.Time); ok && !twd.IsZero() {
+		timeout = time.NewTimer(time.Until(twd))
 		c = timeout.C
 		defer timeout.Stop()
 	}
@@ -353,7 +368,7 @@ RESET_TIMER:
 
 		// make sure write do not overflow the max sliding window on both side
 		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+		if waitsnd < int(s.kcp.snd_wnd) {
 			// transmit all data sequentially, make sure every packet size is within 'mss'
 			for _, b := range v {
 				n += len(b)
@@ -370,11 +385,11 @@ RESET_TIMER:
 			}
 
 			waitsnd = s.kcp.WaitSnd()
-			if waitsnd >= int(s.kcp.snd_wnd) || waitsnd >= int(s.kcp.rmt_wnd) || !s.writeDelay {
+			if waitsnd >= int(s.kcp.snd_wnd) || !s.writeDelay {
 				// put the packets on wire immediately if the inflight window is full
 				// or if we've specified write no delay(NO merging of outgoing bytes)
 				// we don't have to wait until the periodical update() procedure uncorks.
-				s.kcp.flush(false)
+				s.kcp.flush(IFLUSH_FULL)
 			}
 			s.mu.Unlock()
 			atomic.AddUint64(&DefaultSnmp.BytesSent, uint64(n))
@@ -401,6 +416,15 @@ RESET_TIMER:
 	}
 }
 
+func (s *UDPSession) isClosed() bool {
+	select {
+	case <-s.die:
+		return true
+	default:
+		return false
+	}
+}
+
 // Close closes the connection.
 func (s *UDPSession) Close() error {
 	var once bool
@@ -414,13 +438,7 @@ func (s *UDPSession) Close() error {
 
 		// try best to send all queued messages especially the data in txqueue
 		s.mu.Lock()
-		s.kcp.flush(false)
-
-		// release pending segments to recyle memory
-		s.kcp.ReleaseTX()
-		if s.fecDecoder != nil {
-			s.fecDecoder.release()
-		}
+		s.kcp.flush((IFLUSH_FULL))
 		s.mu.Unlock()
 
 		if s.l != nil { // belongs to listener
@@ -444,10 +462,8 @@ func (s *UDPSession) RemoteAddr() net.Addr { return s.remote }
 
 // SetDeadline sets the deadline associated with the listener. A zero time value disables the deadline.
 func (s *UDPSession) SetDeadline(t time.Time) error {
-	s.mu.Lock()
-	s.rd = t
-	s.wd = t
-	s.mu.Unlock()
+	s.rd.Store(t)
+	s.wd.Store(t)
 	s.notifyReadEvent()
 	s.notifyWriteEvent()
 	return nil
@@ -455,18 +471,14 @@ func (s *UDPSession) SetDeadline(t time.Time) error {
 
 // SetReadDeadline implements the Conn SetReadDeadline method.
 func (s *UDPSession) SetReadDeadline(t time.Time) error {
-	s.mu.Lock()
-	s.rd = t
-	s.mu.Unlock()
+	s.rd.Store(t)
 	s.notifyReadEvent()
 	return nil
 }
 
 // SetWriteDeadline implements the Conn SetWriteDeadline method.
 func (s *UDPSession) SetWriteDeadline(t time.Time) error {
-	s.mu.Lock()
-	s.wd = t
-	s.mu.Unlock()
+	s.wd.Store(t)
 	s.notifyWriteEvent()
 	return nil
 }
@@ -497,7 +509,7 @@ func (s *UDPSession) SetMtu(mtu int) bool {
 	return true
 }
 
-// SetStreamMode toggles the stream mode on/off
+// Deprecated: toggles the stream mode on/off
 func (s *UDPSession) SetStreamMode(enable bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -590,14 +602,41 @@ func (s *UDPSession) SetWriteBuffer(bytes int) error {
 	return errInvalidOperation
 }
 
+// SetRateLimit sets the rate limit for this session in bytes per second,
+// by setting to 0 will disable rate limiting.
+func (s *UDPSession) SetRateLimit(bytesPerSecond uint32) {
+	var limiter *rate.Limiter
+	if bytesPerSecond == 0 {
+		limiter = rate.NewLimiter(rate.Inf, maxBatchSize*mtuLimit)
+	} else {
+		limiter = rate.NewLimiter(rate.Limit(bytesPerSecond), maxBatchSize*mtuLimit)
+	}
+
+	s.rateLimiter.Store(limiter)
+}
+
+// Control applys a procedure to the underly socket fd.
+// CAUTION: BE VERY CAREFUL TO USE THIS FUNCTION, YOU MAY BREAK THE PROTOCOL.
+func (s *UDPSession) Control(f func(conn net.PacketConn) error) error {
+	if !s.ownConn {
+		return errNotOwner
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return f(s.conn)
+}
+
 // a goroutine to handle post processing of kcp and make the critical section smaller
 // pipeline for outgoing packets (from ARQ to network)
 //
 //	KCP output -> FEC encoding -> CRC32 integrity -> Encryption -> TxQueue
 func (s *UDPSession) postProcess() {
-	txqueue := make([]ipv4.Message, 0, acceptBacklog)
-	chCork := make(chan struct{}, 1)
+	txqueue := make([]ipv4.Message, 0, devBacklog)
+	chDie := s.die
 
+	ctx := context.Background()
+	bytesToSend := 0
 	for {
 		select {
 		case buf := <-s.chPostProcessing: // dequeue from post processing
@@ -629,6 +668,7 @@ func (s *UDPSession) postProcess() {
 
 			// original copy, move buf to txqueue directly
 			msg.Buffers = [][]byte{buf}
+			bytesToSend += len(buf)
 			txqueue = append(txqueue, msg)
 
 			// dup copies for testing if set
@@ -636,6 +676,7 @@ func (s *UDPSession) postProcess() {
 				bts := xmitBuf.Get().([]byte)[:len(buf)]
 				copy(bts, buf)
 				msg.Buffers = [][]byte{bts}
+				bytesToSend += len(bts)
 				txqueue = append(txqueue, msg)
 			}
 
@@ -644,19 +685,18 @@ func (s *UDPSession) postProcess() {
 				bts := xmitBuf.Get().([]byte)[:len(ecc[k])]
 				copy(bts, ecc[k])
 				msg.Buffers = [][]byte{bts}
+				bytesToSend += len(bts)
 				txqueue = append(txqueue, msg)
 			}
 
-			// notify chCork only when chPostProcessing is empty
-			if len(s.chPostProcessing) == 0 {
-				select {
-				case chCork <- struct{}{}:
-				default:
+			// transmit when chPostProcessing is empty or we've reached max batch size
+			if len(s.chPostProcessing) == 0 || len(txqueue) >= maxBatchSize {
+				if limiter, ok := s.rateLimiter.Load().(*rate.Limiter); ok {
+					err := limiter.WaitN(ctx, bytesToSend)
+					if err != nil {
+						panic(err)
+					}
 				}
-			}
-
-		case <-chCork: // emulate a corked socket
-			if len(txqueue) > 0 {
 				s.tx(txqueue)
 				// recycle
 				for k := range txqueue {
@@ -664,9 +704,18 @@ func (s *UDPSession) postProcess() {
 					txqueue[k].Buffers = nil
 				}
 				txqueue = txqueue[:0]
+				bytesToSend = 0
 			}
 
-		case <-s.die:
+			// re-enable die channel
+			chDie = s.die
+
+		case <-chDie:
+			// remaining packets in txqueue should be sent out
+			if len(s.chPostProcessing) > 0 {
+				chDie = nil // block chDie temporarily
+				continue
+			}
 			return
 		}
 	}
@@ -678,9 +727,9 @@ func (s *UDPSession) update() {
 	case <-s.die:
 	default:
 		s.mu.Lock()
-		interval := s.kcp.flush(false)
+		interval := s.kcp.flush(IFLUSH_FULL)
 		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+		if waitsnd < int(s.kcp.snd_wnd) {
 			s.notifyWriteEvent()
 		}
 		s.mu.Unlock()
@@ -765,16 +814,12 @@ func (s *UDPSession) packetInput(data []byte) {
 }
 
 func (s *UDPSession) kcpInput(data []byte) {
-	var kcpInErrors, fecErrs, fecRecovered, fecParityShards uint64
+	var kcpInErrors uint64
 
 	fecFlag := binary.LittleEndian.Uint16(data[4:])
 	if fecFlag == typeData || fecFlag == typeParity { // 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
 		if len(data) >= fecHeaderSizePlus2 {
 			f := fecPacket(data)
-			if f.flag() == typeParity {
-				fecParityShards++
-			}
-
 			// lock
 			s.mu.Lock()
 			// if fecDecoder is not initialized, create one with default parameter
@@ -796,16 +841,10 @@ func (s *UDPSession) kcpInput(data []byte) {
 				if len(r) >= 2 { // must be larger than 2bytes
 					sz := binary.LittleEndian.Uint16(r)
 					if int(sz) <= len(r) && sz >= 2 {
-						if ret := s.kcp.Input(r[2:sz], false, s.ackNoDelay); ret == 0 {
-							fecRecovered++
-						} else {
+						if ret := s.kcp.Input(r[2:sz], false, s.ackNoDelay); ret != 0 {
 							kcpInErrors++
 						}
-					} else {
-						fecErrs++
 					}
-				} else {
-					fecErrs++
 				}
 				// recycle the buffer
 				xmitBuf.Put(r)
@@ -819,7 +858,7 @@ func (s *UDPSession) kcpInput(data []byte) {
 			// to notify the writers if the window size allows to send more packets
 			// and the remote window size is not full.
 			waitsnd := s.kcp.WaitSnd()
-			if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+			if waitsnd < int(s.kcp.snd_wnd) {
 				s.notifyWriteEvent()
 			}
 			s.mu.Unlock()
@@ -835,7 +874,7 @@ func (s *UDPSession) kcpInput(data []byte) {
 			s.notifyReadEvent()
 		}
 		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+		if waitsnd < int(s.kcp.snd_wnd) {
 			s.notifyWriteEvent()
 		}
 		s.mu.Unlock()
@@ -843,19 +882,9 @@ func (s *UDPSession) kcpInput(data []byte) {
 
 	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
 	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
-	if fecParityShards > 0 {
-		atomic.AddUint64(&DefaultSnmp.FECParityShards, fecParityShards)
-	}
 	if kcpInErrors > 0 {
 		atomic.AddUint64(&DefaultSnmp.KCPInErrors, kcpInErrors)
 	}
-	if fecErrs > 0 {
-		atomic.AddUint64(&DefaultSnmp.FECErrs, fecErrs)
-	}
-	if fecRecovered > 0 {
-		atomic.AddUint64(&DefaultSnmp.FECRecovered, fecRecovered)
-	}
-
 }
 
 type (
@@ -1010,7 +1039,10 @@ func (l *Listener) Accept() (net.Conn, error) {
 func (l *Listener) AcceptKCP() (*UDPSession, error) {
 	var timeout <-chan time.Time
 	if tdeadline, ok := l.rd.Load().(time.Time); ok && !tdeadline.IsZero() {
-		timeout = time.After(time.Until(tdeadline))
+		timer := time.NewTimer(time.Until(tdeadline))
+		defer timer.Stop()
+
+		timeout = timer.C
 	}
 
 	select {
@@ -1058,6 +1090,14 @@ func (l *Listener) Close() error {
 		err = errors.WithStack(io.ErrClosedPipe)
 	}
 	return err
+}
+
+// Control applys a procedure to the underly socket fd.
+// CAUTION: BE VERY CAREFUL TO USE THIS FUNCTION, YOU MAY BREAK THE PROTOCOL.
+func (l *Listener) Control(f func(conn net.PacketConn) error) error {
+	l.sessionLock.Lock()
+	defer l.sessionLock.Unlock()
+	return f(l.conn)
 }
 
 // closeSession notify the listener that a session has closed
@@ -1147,6 +1187,11 @@ func DialWithOptions(raddr string, block BlockCrypt, dataShards, parityShards in
 	var convid uint32
 	binary.Read(rand.Reader, binary.LittleEndian, &convid)
 	return newUDPSession(convid, dataShards, parityShards, nil, conn, true, udpaddr, block), nil
+}
+
+// NewConn4 establishes a session and talks KCP protocol over a packet connection.
+func NewConn4(convid uint32, raddr net.Addr, block BlockCrypt, dataShards, parityShards int, ownConn bool, conn net.PacketConn) (*UDPSession, error) {
+	return newUDPSession(convid, dataShards, parityShards, nil, conn, ownConn, raddr, block), nil
 }
 
 // NewConn3 establishes a session and talks KCP protocol over a packet connection.

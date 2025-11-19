@@ -51,6 +51,8 @@ const (
 	SALT = "kcp-go"
 	// maximum supported smux version
 	maxSmuxVer = 2
+	// scavenger check period
+	scavengePeriod = 5
 )
 
 var VpnMode = false
@@ -123,6 +125,11 @@ func main() {
 			Name:  "mtu",
 			Value: 1350,
 			Usage: "set maximum transmission unit for UDP packets",
+		},
+		cli.IntFlag{
+			Name:  "ratelimit",
+			Value: 0,
+			Usage: "set maximum outgoing speed (in bytes per second) for a single KCP connection, 0 to disable. Enabling this will improve the stability of connections under high speed.",
 		},
 		cli.IntFlag{
 			Name:  "sndwnd",
@@ -203,6 +210,11 @@ func main() {
 			Value: 10, // nat keepalive interval in seconds
 			Usage: "seconds between heartbeats",
 		},
+		cli.IntFlag{
+			Name:  "closewait",
+			Value: 0,
+			Usage: "the seconds to wait before tearing down a connection",
+		},
 		cli.StringFlag{
 			Name:  "snmplog",
 			Value: "",
@@ -247,6 +259,8 @@ func main() {
 	myApp.Action = func(c *cli.Context) error {
 		config := Config{}
 
+		config.Vpn = c.Bool("V")
+
 		config.LocalAddr = c.String("localaddr")
 		config.RemoteAddr = c.String("remoteaddr")
 		config.Key = c.String("key")
@@ -256,6 +270,7 @@ func main() {
 		config.AutoExpire = c.Int("autoexpire")
 		config.ScavengeTTL = c.Int("scavengettl")
 		config.MTU = c.Int("mtu")
+		config.RateLimit = c.Int("ratelimit")
 		config.SndWnd = c.Int("sndwnd")
 		config.RcvWnd = c.Int("rcvwnd")
 		config.DataShard = c.Int("datashard")
@@ -280,7 +295,7 @@ func main() {
 		config.Pprof = c.Bool("pprof")
 		config.QPP = c.Bool("QPP")
 		config.QPPCount = c.Int("QPPCount")
-		config.Vpn = c.Bool("V")
+		config.CloseWait = c.Int("closewait")
 
 		if c.String("c") != "" {
 			err := parseJSONConfig(&config, c.String("c"))
@@ -289,7 +304,10 @@ func main() {
 
 		opts, err := parseEnv()
 		if err == nil {
-			fmt.Printf("test")
+			if _, b := opts.Get("__android_vpn"); b {
+				config.Vpn = true
+			}
+
 			if c, b := opts.Get("localaddr"); b {
 				config.LocalAddr = c
 			}
@@ -323,6 +341,11 @@ func main() {
 			if c, b := opts.Get("mtu"); b {
 				if mtu, err := strconv.Atoi(c); err == nil {
 					config.MTU = mtu
+				}
+			}
+			if c, b := opts.Get("ratelimit"); b {
+				if ratelimit, err := strconv.Atoi(c); err == nil {
+					config.RateLimit = ratelimit
 				}
 			}
 			if c, b := opts.Get("sndwnd"); b {
@@ -436,9 +459,12 @@ func main() {
 					config.QPPCount = qppcount
 				}
 			}
-			if _, b := opts.Get("__android_vpn"); b {
-				config.Vpn = true
+			if c, b := opts.Get("closewait"); b {
+				if closewait, err := strconv.Atoi(c); err == nil {
+					config.CloseWait = closewait
+				}
 			}
+
 		}
 
 		// log redirect
@@ -490,6 +516,7 @@ func main() {
 		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
 		log.Println("compression:", !config.NoComp)
 		log.Println("mtu:", config.MTU)
+		log.Println("ratelimit:", config.RateLimit)
 		log.Println("datashard:", config.DataShard, "parityshard:", config.ParityShard)
 		log.Println("acknodelay:", config.AckNodelay)
 		log.Println("dscp:", config.DSCP)
@@ -524,6 +551,12 @@ func main() {
 			if new(big.Int).GCD(nil, nil, big.NewInt(int64(config.QPPCount)), big.NewInt(8)).Int64() != 1 {
 				color.Red("QPP Warning: QPPCount %d, choose a prime number for security", config.QPPCount)
 			}
+		}
+
+		// Scavenge parameters check
+		if config.AutoExpire != 0 && config.ScavengeTTL > config.AutoExpire {
+			color.Red("WARNING: scavengettl is bigger than autoexpire, connections may race hard to use bandwidth.")
+			color.Red("Try limiting scavengettl to a smaller value.")
 		}
 
 		// SMUX Version check
@@ -578,6 +611,7 @@ func main() {
 			kcpconn.SetWindowSize(config.SndWnd, config.RcvWnd)
 			kcpconn.SetMtu(config.MTU)
 			kcpconn.SetACKNoDelay(config.AckNodelay)
+			kcpconn.SetRateLimit(uint32(config.RateLimit))
 
 			if err := kcpconn.SetDSCP(config.DSCP); err != nil {
 				log.Println("SetDSCP:", err)
@@ -632,9 +666,11 @@ func main() {
 			go http.ListenAndServe(":6060", nil)
 		}
 
-		// start scavenger
+		// start scavenger if autoexpire is set
 		chScavenger := make(chan timedSession, 128)
-		go scavenger(chScavenger, &config)
+		if config.AutoExpire > 0 {
+			go scavenger(chScavenger, &config)
+		}
 
 		// start parent process monitor
 		go parentMonitor(3)
@@ -667,7 +703,7 @@ func main() {
 				}
 			}
 
-			go handleClient(_Q_, []byte(config.Key), muxes[idx].session, p1, config.Quiet)
+			go handleClient(_Q_, []byte(config.Key), muxes[idx].session, p1, config.Quiet, config.CloseWait)
 			rr++
 		}
 	}
@@ -690,7 +726,7 @@ func parentMonitor(interval int) {
 }
 
 // handleClient aggregates connection p1 on mux
-func handleClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, session *smux.Session, p1 net.Conn, quiet bool) {
+func handleClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, session *smux.Session, p1 net.Conn, quiet bool, closeWait int) {
 	logln := func(v ...interface{}) {
 		if !quiet {
 			log.Println(v...)
@@ -717,7 +753,7 @@ func handleClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, session *smux.Ses
 	}
 
 	// stream layer
-	err1, err2 := std.Pipe(s1, s2)
+	err1, err2 := std.Pipe(s1, s2, closeWait)
 
 	// handles transport layer errors
 	if err1 != nil && err1 != io.EOF {
@@ -743,13 +779,7 @@ type timedSession struct {
 
 // scavenger goroutine is used to close expired sessions
 func scavenger(ch chan timedSession, config *Config) {
-	// When AutoExpire is set to 0 (default), sessionList will keep empty.
-	// Then this routine won't need to do anything; thus just terminate it.
-	if config.AutoExpire <= 0 {
-		return
-	}
-
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(scavengePeriod * time.Second)
 	defer ticker.Stop()
 	var sessionList []timedSession
 	for {
@@ -759,10 +789,6 @@ func scavenger(ch chan timedSession, config *Config) {
 				item.session,
 				item.expiryDate.Add(time.Duration(config.ScavengeTTL) * time.Second)})
 		case <-ticker.C:
-			if len(sessionList) == 0 {
-				continue
-			}
-
 			var newList []timedSession
 			for k := range sessionList {
 				s := sessionList[k]

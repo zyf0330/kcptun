@@ -115,6 +115,11 @@ func main() {
 			Usage: "set maximum transmission unit for UDP packets",
 		},
 		cli.IntFlag{
+			Name:  "maxspeed",
+			Value: 0,
+			Usage: "set maximum outgoing speed (in bytes per second) for a single KCP connection, 0 to disable. Enabling this will improve the stability of connections under high speed.",
+		},
+		cli.IntFlag{
 			Name:  "sndwnd",
 			Value: 1024,
 			Usage: "set send window size(num of packets)",
@@ -193,6 +198,11 @@ func main() {
 			Value: 10, // nat keepalive interval in seconds
 			Usage: "seconds between heartbeats",
 		},
+		cli.IntFlag{
+			Name:  "closewait",
+			Value: 30,
+			Usage: "the seconds to wait before tearing down a connection",
+		},
 		cli.StringFlag{
 			Name:  "snmplog",
 			Value: "",
@@ -234,6 +244,7 @@ func main() {
 		config.Crypt = c.String("crypt")
 		config.Mode = c.String("mode")
 		config.MTU = c.Int("mtu")
+		config.RateLimit = c.Int("ratelimit")
 		config.SndWnd = c.Int("sndwnd")
 		config.RcvWnd = c.Int("rcvwnd")
 		config.DataShard = c.Int("datashard")
@@ -258,6 +269,7 @@ func main() {
 		config.TCP = c.Bool("tcp")
 		config.QPP = c.Bool("QPP")
 		config.QPPCount = c.Int("QPPCount")
+		config.CloseWait = c.Int("closewait")
 
 		if c.String("c") != "" {
 			//Now only support json config file
@@ -285,6 +297,12 @@ func main() {
 			if c, b := opts.Get("mtu"); b {
 				if mtu, err := strconv.Atoi(c); err == nil {
 					config.MTU = mtu
+				}
+			}
+
+			if c, b := opts.Get("ratelimit"); b {
+				if ratelimit, err := strconv.Atoi(c); err == nil {
+					config.RateLimit = ratelimit
 				}
 			}
 			if c, b := opts.Get("sndwnd"); b {
@@ -403,6 +421,12 @@ func main() {
 					config.QPPCount = qppcount
 				}
 			}
+			if c, b := opts.Get("closewait"); b {
+				if closewait, err := strconv.Atoi(c); err == nil {
+					config.CloseWait = closewait
+				}
+			}
+
 		}
 
 		// log redirect
@@ -433,6 +457,7 @@ func main() {
 		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
 		log.Println("compression:", !config.NoComp)
 		log.Println("mtu:", config.MTU)
+		log.Println("ratelimit:", config.RateLimit)
 		log.Println("datashard:", config.DataShard, "parityshard:", config.ParityShard)
 		log.Println("acknodelay:", config.AckNodelay)
 		log.Println("dscp:", config.DSCP)
@@ -538,6 +563,7 @@ func main() {
 					conn.SetMtu(config.MTU)
 					conn.SetWindowSize(config.SndWnd, config.RcvWnd)
 					conn.SetACKNoDelay(config.AckNodelay)
+					conn.SetRateLimit(uint32(config.RateLimit))
 
 					if config.NoComp {
 						go handleMux(_Q_, conn, &config)
@@ -642,7 +668,7 @@ func handleMux(_Q_ *qpp.QuantumPermutationPad, conn net.Conn, config *Config) {
 					p1.Close()
 					return
 				}
-				handleClient(_Q_, []byte(config.Key), p1, p2, config.Quiet)
+				handleClient(_Q_, []byte(config.Key), p1, p2, config.Quiet, config.CloseWait)
 			case TGT_UNIX:
 				p2, err = net.Dial("unix", config.Target)
 				if err != nil {
@@ -650,7 +676,7 @@ func handleMux(_Q_ *qpp.QuantumPermutationPad, conn net.Conn, config *Config) {
 					p1.Close()
 					return
 				}
-				handleClient(_Q_, []byte(config.Key), p1, p2, config.Quiet)
+				handleClient(_Q_, []byte(config.Key), p1, p2, config.Quiet, config.CloseWait)
 			}
 
 		}(stream)
@@ -658,7 +684,7 @@ func handleMux(_Q_ *qpp.QuantumPermutationPad, conn net.Conn, config *Config) {
 }
 
 // handleClient pipes two streams
-func handleClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, p1 *smux.Stream, p2 net.Conn, quiet bool) {
+func handleClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, p1 *smux.Stream, p2 net.Conn, quiet bool, closeWait int) {
 	logln := func(v ...interface{}) {
 		if !quiet {
 			log.Println(v...)
@@ -679,7 +705,7 @@ func handleClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, p1 *smux.Stream, 
 	}
 
 	// stream layer
-	err1, err2 := std.Pipe(s1, s2)
+	err1, err2 := std.Pipe(s1, s2, closeWait)
 
 	// handles transport layer errors
 	if err1 != nil && err1 != io.EOF {

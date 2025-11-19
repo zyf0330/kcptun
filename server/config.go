@@ -35,6 +35,7 @@ type Config struct {
 	Crypt        string `json:"crypt"`
 	Mode         string `json:"mode"`
 	MTU          int    `json:"mtu"`
+	RateLimit    int    `json:"ratelimit"`
 	SndWnd       int    `json:"sndwnd"`
 	RcvWnd       int    `json:"rcvwnd"`
 	DataShard    int    `json:"datashard"`
@@ -59,6 +60,7 @@ type Config struct {
 	TCP          bool   `json:"tcp"`
 	QPP          bool   `json:"qpp"`
 	QPPCount     int    `json:"qpp-count"`
+	CloseWait    int    `json:"closewait"`
 }
 
 func parseJSONConfig(config *Config, path string) error {

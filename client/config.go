@@ -29,6 +29,8 @@ import (
 
 // Config for client
 type Config struct {
+	Vpn bool `json:"vpn"`
+
 	LocalAddr    string `json:"localaddr"`
 	RemoteAddr   string `json:"remoteaddr"`
 	Key          string `json:"key"`
@@ -38,6 +40,7 @@ type Config struct {
 	AutoExpire   int    `json:"autoexpire"`
 	ScavengeTTL  int    `json:"scavengettl"`
 	MTU          int    `json:"mtu"`
+	RateLimit    int    `json:"ratelimit"`
 	SndWnd       int    `json:"sndwnd"`
 	RcvWnd       int    `json:"rcvwnd"`
 	DataShard    int    `json:"datashard"`
@@ -62,7 +65,7 @@ type Config struct {
 	Pprof        bool   `json:"pprof"`
 	QPP          bool   `json:"qpp"`
 	QPPCount     int    `json:"qpp-count"`
-	Vpn          bool   `json:"vpn"`
+	CloseWait    int    `json:"closewait"`
 }
 
 func parseJSONConfig(config *Config, path string) error {
